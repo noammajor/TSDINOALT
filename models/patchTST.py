@@ -13,6 +13,8 @@ from collections import OrderedDict
 from ..models.layers.pos_encoding import *
 from ..models.layers.basics import *
 from ..models.layers.attention import *
+from ..utils.util import get_activation_fn
+from ..utils.util import DropPath
 
             
 # Cell
@@ -313,7 +315,7 @@ class TSTEncoderLayer(nn.Module):
         if self.store_attn:
             self.attn = attn
         ## Add & Norm
-        src = src + self.dropout_attn(src2) # Add: residual connection with residual dropout
+        src = src + self.drop_path(self.dropout_attn(src2)) # Add: residual connection with residual dropout
         if not self.pre_norm:
             src = self.norm_attn(src)
 
@@ -323,7 +325,7 @@ class TSTEncoderLayer(nn.Module):
         ## Position-wise Feed-Forward
         src2 = self.ff(src)
         ## Add & Norm
-        src = src + self.dropout_ffn(src2) # Add: residual connection with residual dropout
+        src = src + self.drop_path(self.dropout_ffn(src2)) # Add: residual connection with residual dropout
         if not self.pre_norm:
             src = self.norm_ffn(src)
 
