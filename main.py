@@ -3,100 +3,135 @@ import pandas as pd
 import os
 import torch
 from torch import nn
+import random
+import torch.nn.functional as F
+import torchvision.transforms as transforms
 from models.patchTST import PatchTST
-
+import torch.distributed as dist
+import torch.backends.cudnn as cudnn
+import time
+import datetime
+import math
+import sys
+from pathlib import Path
+import json
+import data_agumentation as aug
+from models.layers.Dino_Head import DINOHead
+import utils.util as utils
+import dataPuller as dpuller
 import argparse
 
-parser = argparse.ArgumentParser()
-# Transformer:
-parser.add_argument('--target_points', type=int, default=96, help='forecast horizon')
-parser.add_argument('--patch_len', type=int, default=12, help='patch length')
-parser.add_argument('--n_layers', type=int, default=3, help='number of Transformer layers')
-parser.add_argument('--n_heads', type=int, default=16, help='number of Transformer heads')
-parser.add_argument('--embed_dim', type=int, default=128, help='Transformer d_model')
-parser.add_argument('--d_ff', type=int, default=512, help='Tranformer MLP dimension')
-parser.add_argument('--dropout', type=float, default=0.2, help='Transformer dropout')
-parser.add_argument('--head_dropout', type=float, default=0.2, help='head dropout')
-parser.add_argument('--activation_function', type=str, default="relu", help='activation function')
-parser.add_argument('--c_in', type=int, default=1, help='number of input variables')
-#dino
-parser.add_argument('--norm_last_layer', default=True, type=utils.bool_flag,
-    help="""Whether or not to weight normalize the last layer of the DINO head.
-    Not normalizing leads to better performance but can make the training unstable.
-    In our experiments, we typically set this paramater to False with vit_small and True with vit_base.""")
-parser.add_argument('--momentum_teacher', default=0.996, type=float, help="""Base EMA
-    parameter for teacher update. The value is increased to 1 during training with cosine schedule.
-    We recommend setting a higher value with small batches: for example use 0.9995 with batch size of 256.""")
-parser.add_argument('--use_bn_in_head', default=False, type=utils.bool_flag,
-    help="Whether to use batch normalizations in projection head (Default: False)")
-# Temperature teacher parameters
-parser.add_argument('--warmup_teacher_temp', default=0.04, type=float,
-    help="""Initial value for the teacher temperature: 0.04 works well in most cases.
-    Try decreasing it if the training loss does not decrease.""")
-parser.add_argument('--teacher_temp', default=0.04, type=float, help="""Final value (after linear warmup)
-    of the teacher temperature. For most experiments, anything above 0.07 is unstable. We recommend
-    starting with the default value of 0.04 and increase this slightly if needed.""")
-parser.add_argument('--warmup_teacher_temp_epochs', default=0, type=int,
-    help='Number of warmup epochs for the teacher temperature (Default: 30).')
-# Training/Optimization parameters
-parser.add_argument('--use_fp16', type=utils.bool_flag, default=True, help="""Whether or not
-    to use half precision for training. Improves training time and memory requirements,
-    but can provoke instability and slight decay of performance. We recommend disabling
-    mixed precision if the loss is unstable, if reducing the patch size or if training with bigger ViTs.""")
-parser.add_argument('--weight_decay', type=float, default=0.04, help="""Initial value of the
-    weight decay. With ViT, a smaller value at the beginning of training works well.""")
-parser.add_argument('--weight_decay_end', type=float, default=0.4, help="""Final value of the
-    weight decay. We use a cosine schedule for WD and using a larger decay by
-    the end of training improves performance for ViTs.""")
-parser.add_argument('--clip_grad', type=float, default=3.0, help="""Maximal parameter
-    gradient norm if using gradient clipping. Clipping with norm .3 ~ 1.0 can
-    help optimization for larger ViT architectures. 0 for disabling.""")
-parser.add_argument('--batch_size_per_gpu', default=64, type=int,
-    help='Per-GPU batch-size : number of distinct images loaded on one GPU.')
-parser.add_argument('--epochs', default=100, type=int, help='Number of epochs of training.')
-parser.add_argument('--freeze_last_layer', default=1, type=int, help="""Number of epochs
-    during which we keep the output layer fixed. Typically doing so during
-    the first epoch helps training. Try increasing this value if the loss does not decrease.""")
-parser.add_argument("--lr", default=0.0005, type=float, help="""Learning rate at the end of
-    linear warmup (highest LR used during training). The learning rate is linearly scaled
-    with the batch size, and specified here for a reference batch size of 256.""")
-parser.add_argument("--warmup_epochs", default=10, type=int,
-    help="Number of epochs for the linear learning-rate warm up.")
-parser.add_argument('--min_lr', type=float, default=1e-6, help="""Target LR at the
-    end of optimization. We use a cosine LR schedule with linear warmup.""")
-parser.add_argument('--optimizer', default='adamw', type=str,
-    choices=['adamw', 'sgd'], help="""Type of optimizer. We recommend using adamw with ViTs.""")
-parser.add_argument('--drop_path_rate', type=float, default=0.1, help="stochastic depth rate")
-parser.add_argument('--drop_path_rate', type=float, default=0.1, help="stochastic depth rate")
-#data
-parser.add_argument('--stride', type=int, default=12, help='stride between patch')
-parser.add_argument('--context_points', type=int, default=512, help='sequence length')
- # Misc
-parser.add_argument('--data_path', default='/path/to/imagenet/train/', type=str,
-    help='Please specify path to the ImageNet training data.')
-parser.add_argument('--output_dir', default=".", type=str, help='Path to save logs and checkpoints.')
-parser.add_argument('--saveckp_freq', default=20, type=int, help='Save checkpoint every x epochs.')
-parser.add_argument('--seed', default=0, type=int, help='Random seed.')
-parser.add_argument('--num_workers', default=10, type=int, help='Number of data loading workers per GPU.')
-parser.add_argument('--num_transformations', type=int, default=2, help='Number of transformations per sample.')
-parser.add_argument('--transformation_group_size', type=int, default=2, help='data steps in a transformation.')
+def get_args_parser():
+    parser = argparse.ArgumentParser('DINO', add_help=False)
 
-# get available GPU devide
-set_device()
+    # Transformer:
+    parser.add_argument('--target_points', type=int, default=96, help='forecast horizon')
+    parser.add_argument('--patch_len', type=int, default=12, help='patch length')
+    parser.add_argument('--n_layers', type=int, default=3, help='number of Transformer layers')
+    parser.add_argument('--n_heads', type=int, default=16, help='number of Transformer heads')
+    parser.add_argument('--embed_dim', type=int, default=128, help='Transformer d_model')
+    parser.add_argument('--d_ff', type=int, default=512, help='Tranformer MLP dimension')
+    parser.add_argument('--dropout', type=float, default=0.2, help='Transformer dropout')
+    parser.add_argument('--head_dropout', type=float, default=0.2, help='head dropout')
+    parser.add_argument('--c_in', type=int, default=7, help='number of input variables')
+    #dino
+    parser.add_argument('--norm_last_layer', default=True, type=utils.bool_flag,
+        help="""Whether or not to weight normalize the last layer of the DINO head.
+        Not normalizing leads to better performance but can make the training unstable.
+        In our experiments, we typically set this paramater to False with vit_small and True with vit_base.""")
+    parser.add_argument('--momentum_teacher', default=0.996, type=float, help="""Base EMA
+        parameter for teacher update. The value is increased to 1 during training with cosine schedule.
+        We recommend setting a higher value with small batches: for example use 0.9995 with batch size of 256.""")
+    parser.add_argument('--use_bn_in_head', default=False, type=utils.bool_flag,
+        help="Whether to use batch normalizations in projection head (Default: False)")
+    parser.add_argument('--out_dim', default=35536, type=int, help="""Dimensionality of
+        the DINO head output. For complex and large datasets large values (like 65k) work well.""")
+    # Temperature teacher parameters
+    parser.add_argument('--warmup_teacher_temp', default=0.04, type=float,
+        help="""Initial value for the teacher temperature: 0.04 works well in most cases.
+        Try decreasing it if the training loss does not decrease.""")
+    parser.add_argument('--teacher_temp', default=0.04, type=float, help="""Final value (after linear warmup)
+        of the teacher temperature. For most experiments, anything above 0.07 is unstable. We recommend
+        starting with the default value of 0.04 and increase this slightly if needed.""")
+    parser.add_argument('--warmup_teacher_temp_epochs', default=0, type=int,
+        help='Number of warmup epochs for the teacher temperature (Default: 30).')
+    # Training/Optimization parameters
+    parser.add_argument('--use_fp16', type=utils.bool_flag, default=False, help="""Whether or not
+        to use half precision for training. Improves training time and memory requirements,
+        but can provoke instability and slight decay of performance. We recommend disabling
+        mixed precision if the loss is unstable, if reducing the patch size or if training with bigger ViTs.""")
+    parser.add_argument('--weight_decay', type=float, default=0.04, help="""Initial value of the
+        weight decay. With ViT, a smaller value at the beginning of training works well.""")
+    parser.add_argument('--weight_decay_end', type=float, default=0.4, help="""Final value of the
+        weight decay. We use a cosine schedule for WD and using a larger decay by
+        the end of training improves performance for ViTs.""")
+    parser.add_argument('--clip_grad', type=float, default=3.0, help="""Maximal parameter
+        gradient norm if using gradient clipping. Clipping with norm .3 ~ 1.0 can
+        help optimization for larger ViT architectures. 0 for disabling.""")
+    parser.add_argument('--num_patches', default=32, type=int,help='Batch size')
+    parser.add_argument('--batch_size_per_gpu', default=64, type=int,
+        help='Per-GPU batch-size : number of distinct images loaded on one GPU.')
+    parser.add_argument('--epochs', default=100, type=int, help='Number of epochs of training.')
+    parser.add_argument('--freeze_last_layer', default=1, type=int, help="""Number of epochs
+        during which we keep the output layer fixed. Typically doing so during
+        the first epoch helps training. Try increasing this value if the loss does not decrease.""")
+    parser.add_argument("--lr", default=0.0005, type=float, help="""Learning rate at the end of
+        linear warmup (highest LR used during training). The learning rate is linearly scaled
+        with the batch size, and specified here for a reference batch size of 256.""")
+    parser.add_argument("--warmup_epochs", default=10, type=int,
+        help="Number of epochs for the linear learning-rate warm up.")
+    parser.add_argument('--min_lr', type=float, default=1e-6, help="""Target LR at the
+        end of optimization. We use a cosine LR schedule with linear warmup.""")
+    parser.add_argument('--optimizer', default='adamw', type=str,
+        choices=['adamw', 'sgd'], help="""Type of optimizer. We recommend using adamw with ViTs.""")
+    parser.add_argument('--drop_path_rate', type=float, default=0.1, help="stochastic depth rate")
+    #data
+    parser.add_argument('--stride', type=int, default=12, help='stride between patch')
+    # Misc
+    parser.add_argument('--data_path', default='/path/to/imagenet/train/', type=str,
+        help='Please specify path to the ImageNet training data.')
+    parser.add_argument('--output_dir', default=".", type=str, help='Path to save logs and checkpoints.')
+    parser.add_argument('--saveckp_freq', default=10, type=int, help='Save checkpoint every x epochs.')
+    parser.add_argument('--seed', default=0, type=int, help='Random seed.')
+    parser.add_argument('--num_workers', default=0, type=int, help='Number of data loading workers per GPU.')
+    parser.add_argument('--local_crops_number', type=float, default=0.5, help='size of local crops.')
+    parser.add_argument('--transformation_group_size', type=int, default=2, help='Number of transformations per sample.')
+    parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
+        distributed training; see https://pytorch.org/docs/stable/distributed.html""")
 
-num_patch = (max(args.context_points, args.patch_len)-args.patch_len) // args.stride + 1    
-print('number of patches:', num_patch)
-args = parser.parse_args()
-print('args:', args)
+
+    args = parser.parse_args()
+    print('args:', args)
+    num_patch = args.num_patches
+    print('number of patches:', num_patch)
+    return parser
 
 def train_TS_DINO(args):
     utils.init_distributed_mode(args)
     utils.fix_random_seeds(args.seed)
-    print("git:\n  {}\n".format(utils.get_sha()))
-    print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
-    cudnn.benchmark = True
+    #print("git:\n  {}\n".format(utils.get_sha()))
+    #print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
+    #cudnn.benchmark = True
 
     #-------------DATA-----------------
+    dataAugmentationDino=DataAugmentationDino(
+        local_crops_number=args.local_crops_number,
+        transformation_group_size=args.transformation_group_size)
+    dataset= dpuller.DataPuller(
+        data_dir=args.data_path,
+        split='train',
+        transform=dataAugmentationDino,
+        batch_size=args.num_patches,
+        patch_size=args.patch_len
+    )
+    data_loader = torch.utils.data.DataLoader(
+        dataset,
+        sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True),
+        batch_size=args.batch_size_per_gpu,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=True,
+    )
 
 
     #------------- Student - Teacher network ---------------
@@ -106,16 +141,16 @@ def train_TS_DINO(args):
         target_dim=args.target_points,
         patch_len=args.patch_len,
         stride=args.stride,
-        num_patch=num_patch,
+        num_patch=args.num_patches,
         n_layers=args.n_layers,
         n_heads=args.n_heads,
-        d_model=args.d_model,
+        d_model=args.embed_dim,
         shared_embedding=True,
         d_ff=args.d_ff,                        
         dropout=args.dropout,
         head_dropout=args.head_dropout,
         act='relu',
-        head_type='pretrain',
+        head_type='Dino',
         res_attention=False,
         drop_path_rate=args.drop_path_rate
         )
@@ -124,60 +159,64 @@ def train_TS_DINO(args):
         target_dim=args.target_points,
         patch_len=args.patch_len,
         stride=args.stride,
-        num_patch=num_patch,
+        num_patch=args.num_patches,
         n_layers=args.n_layers,
         n_heads=args.n_heads,
-        d_model=args.d_model,
+        d_model=args.embed_dim,
         shared_embedding=True,
         d_ff=args.d_ff,                        
         dropout=args.dropout,
         head_dropout=args.head_dropout,
         act='relu',
-        head_type='pretrain',
+        head_type='Dino',
         res_attention=False,
-        drop_path_rate=0.0 # no drop path in teacher
+        drop_path_rate=0.0
         )
-    embed_dim = student.embed_dim
-    student = utils.MultiCropWrapper(student, DINOHead(
-        embed_dim,
+    embed_dim = student.backbone.d_model
+    student = utils.TSMultiCropWrapper(student, DINOHead(
+        embed_dim*args.c_in,
         args.out_dim,
         use_bn=args.use_bn_in_head,
         norm_last_layer=args.norm_last_layer,
     ))
-    teacher = utils.MultiCropWrapper(
+    teacher = utils.TSMultiCropWrapper(
         teacher,
-        DINOHead(embed_dim, args.out_dim, args.use_bn_in_head),
+        DINOHead(embed_dim*args.c_in, args.out_dim, args.use_bn_in_head, norm_last_layer=args.norm_last_layer),
     )
     # move networks to gpu
-    student, teacher = student.cuda(), teacher.cuda()
-     synchronize batch norms (if any)
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    student, teacher = student.to(device), teacher.to(device)
+    # synchronize batch norms (if any)
+    device_ids = [args.gpu] if torch.cuda.is_available() else None
     if utils.has_batchnorms(student):
-        student = nn.SyncBatchNorm.convert_sync_batchnorm(student)
-        teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
-
-        # we need DDP wrapper to have synchro batch norms working...
-        teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu])
+        # Around line 190 in train_TS_DINO
+        if torch.cuda.is_available():
+            student = nn.SyncBatchNorm.convert_sync_batchnorm(student)
+            teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
+        else:
+            print("Skipping SyncBatchNorm on Mac/CPU—using standard BatchNorm instead.")
+        teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=device_ids)
         teacher_without_ddp = teacher.module
     else:
         # teacher_without_ddp and teacher are the same thing
         teacher_without_ddp = teacher
-    student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu])
+    student = nn.parallel.DistributedDataParallel(student, device_ids=device_ids)
     # teacher and student start with the same weights
     teacher_without_ddp.load_state_dict(student.module.state_dict())
     # there is no backpropagation through the teacher, so no need for gradients
     for p in teacher.parameters():
         p.requires_grad = False
-    print(f"Student and Teacher are built: they are both {args.arch} network.")
+    print(f"Student and Teacher are built: they are both TS networks.")
 
 #-----------------Loss function --------------------
     dino_loss = DINOLoss(
         args.out_dim,
-        args.num_transformations+2,
+        args.transformation_group_size+3,
         args.warmup_teacher_temp,
         args.teacher_temp,
         args.warmup_teacher_temp_epochs,
         args.epochs,
-    ).cuda()
+    ).to(device)
 # ----------------Optimizer --------------------
     params_groups = utils.get_params_groups(student)
     if args.optimizer == "adamw":
@@ -209,22 +248,24 @@ def train_TS_DINO(args):
         len(data_loader),
     )
 #----------------Train Loop --------------------
-to_restore = {"epoch": 0}
-    utils.restart_from_checkpoint(
-        os.path.join(args.output_dir, "checkpoint.pth"),
-        run_variables=to_restore,
-        student=student,
-        teacher=teacher,
-        optimizer=optimizer,
-        fp16_scaler=fp16_scaler,
-        dino_loss=dino_loss,
-    )
-    start_epoch = to_restore["epoch"]
+    #to_restore = {"epoch": 0}
+   #utils.restart_from_checkpoint(
+    #    os.path.join(args.output_dir, "checkpoint.pth"),
+    #    run_variables=to_restore,
+    #    student=student,
+     #   teacher=teacher,
+      #  optimizer=optimizer,
+       # fp16_scaler=fp16_scaler,
+      #  dino_loss=dino_loss,
+    #)
+    #start_epoch = to_restore["epoch"]
+    start_epoch = 0
 
     start_time = time.time()
     print("Starting TS - DINO training !")
 
     for epoch in range(start_epoch, args.epochs):
+        print(f'Starting epoch {epoch}/{args.epochs}')
         data_loader.sampler.set_epoch(epoch)
         train_stats = train_one_epoch(
             student,
@@ -266,7 +307,10 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     metric_logger.add_meter('weight_decay', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
-    for it, (samples, _) in enumerate(metric_logger.log_every(data_loader, 10, header)):
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    for it, batch in enumerate(metric_logger.log_every(data_loader, 10, header)):
+        samples = batch
+        samples = [s.to(device, non_blocking=True) for s in samples]
         # update learning rate and weight decay according to their schedule
         it_global = it + epoch * len(data_loader)
         for i, param_group in enumerate(optimizer.param_groups):
@@ -275,10 +319,8 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
                 param_group['weight_decay'] = wd_schedule[it_global]
         metric_logger.update(lr=optimizer.param_groups[0]['lr'])
         metric_logger.update(weight_decay=optimizer.param_groups[0]['weight_decay'])
-        # move to gpu
-        samples = [s.cuda(non_blocking=True) for s in samples]
         with torch.cuda.amp.autocast(fp16_scaler is not None):
-            teacher_output = teacher(samples[:2])  # only the 2 global views pass through the teacher
+            teacher_output = teacher(samples[:3])  # only the 3 global views pass through the teacher
             student_output = student(samples)
             loss = dino_loss(student_output, teacher_output, epoch)
         if not math.isfinite(loss.item()):
@@ -309,7 +351,8 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
                 param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
 
         # logging
-        torch.cuda.synchronize()
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
         metric_logger.update(loss=loss.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
@@ -345,7 +388,7 @@ class DINOLoss(nn.Module):
         # teacher centering and sharpening
         temp = self.teacher_temp_schedule[epoch]
         teacher_out = F.softmax((teacher_output - self.center) / temp, dim=-1)
-        teacher_out = teacher_out.detach().chunk(2)
+        teacher_out = teacher_out.detach().chunk(3)
 
         total_loss = 0
         n_loss_terms = 0
@@ -359,6 +402,7 @@ class DINOLoss(nn.Module):
                 n_loss_terms += 1
         total_loss /= n_loss_terms
         self.update_center(teacher_output)
+        print('DINO loss:', total_loss.item())
         return total_loss
 
     @torch.no_grad()
@@ -372,116 +416,75 @@ class DINOLoss(nn.Module):
 
         # ema update
         self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum)
-
-class DataAugmentationDino(object):
-    def __init__(self, global_len, local_len, local_crops_number, transformations):
-        self.global_len = global_len
-        self.local_len = local_len
+#------Data Augmentation for Time Series DINO -------
+class DataAugmentationDino:
+    def __init__(self, local_crops_number, transformation_group_size):
+        self.sigma = random.uniform(0.01, 0.1)
         self.local_crops_number = local_crops_number
-        self.polartransform = polar
-        self.lorentztransform = lorentz
-        self.hyperbolictransform = hyperbolic_amplitude_warp
-        self.localtransform = galilien
-        self.hyperbolictrnsform = HyperBolicGeometry()
-        self.transformations = transformations
-    
-    def polar(self, x):
-        length = x.shape[-1]
-        t = torch.linspace(0, 1, steps=length).to(x.device)
-        y = x[0]
-        teta =torch.atan2(y, t)
-        r = torch.sqrt(t**2 + y**2)
-        t_new = r * torch.cos(teta)
-        y_new = r * torch.sin(teta)
-        x_new = torch.stack([t_new, y_new], dim=0)
-        return x_new
-    def galilien(self, x, a):
-        length = x.shape[-1]
-        t = torch.linspace(0, 1, steps=length).to(x.device)
-        y = x[0]
-        x_new = torch.stack([t, y*a], dim=0)
-        return x_new
-    def lorentz(self, x, v):
-        length = x.shape[-1]
-        device = x.device
-        t = torch.linspace(0, 1, steps=length).to(device)
-        y = x[0] # Shape [length]
-        gamma = 1.0 / torch.sqrt(1.0 - v**2 + 1e-8)
-        t_new = gamma * (t - v * y)
-        y_new = gamma * (y - v * t)
-        x_new = torch.stack([t_new, y_new], dim=0)
-        return x_new
-    def hyperbolic_amplitude_warp(self, x, scale=1.0):
-        t = torch.linspace(0, 1, steps=x.shape[-1]).to(x.device)
-        y = x[0]
-        y_new = torch.tanh(y * scale)
-        
-        return torch.stack([t, y_new], dim=0)
+        self.transformation_group_size = transformation_group_size
+        self.global_transform1 = transforms.Compose([
+            transforms.Lambda(lambda x: x + torch.randn_like(x) * self.sigma),
+            aug.polar_transformation()
+            ])
+        self.global_transform2 = transforms.Compose([
+            transforms.Lambda(lambda x: x + torch.randn_like(x) * 0.1*self.sigma),
+            ])
+        self.global_transform3 = transforms.Compose([
+            transforms.Lambda(lambda x: x + torch.randn_like(x) * 0.1*self.sigma),
+            aug.HyperBolicGeometry()
+            ])
+        self.local_transform1 = transforms.Compose([
+            lambda x: self._random_crop(x,self.local_crops_number),
+            transforms.Lambda(lambda x: x + torch.randn_like(x) * 0.1*self.sigma),
+            aug.galilien_transformation()
+            ])
+        self.local_transform2 = transforms.Compose([
+            lambda x: self._random_crop(x,self.local_crops_number),
+            transforms.Lambda(lambda x: x + torch.randn_like(x) * 0.1*self.sigma),
+            aug.rotation_transformation()
+            ])
+        self.local_transform3 = transforms.Compose([
+            lambda x: self._random_crop(x,self.local_crops_number),
+            transforms.Lambda(lambda x: x + torch.randn_like(x) * 0.1*self.sigma),
+            aug.boost_transformation()
+            ])
+        self.local_transform4 = transforms.Compose([
+            lambda x: self._random_crop(x,self.local_crops_number),
+            transforms.Lambda(lambda x: x + torch.randn_like(x) * 0.1*self.sigma),
+            aug.lorentz_transformation()
+            ])
+        self.local_transform5 = transforms.Compose([
+            lambda x: self._random_crop(x,self.local_crops_number),
+            transforms.Lambda(lambda x: x + torch.randn_like(x) * 0.1*self.sigma),
+            aug.polar_transformation()
+            ])
+        self.local_transform6 = transforms.Compose([
+            lambda x: self._random_crop(x,self.local_crops_number),
+            transforms.Lambda(lambda x: x + torch.randn_like(x) * 0.1*self.sigma),
+            aug.HyperBolicGeometry()
+            ])
 
-    def __call__(self, data):
+
+    def _random_crop(self, x, length):
+        total_len = x.shape[0]
+        start = torch.randint(0, total_len - int(length*total_len) + 1, (1,)).item()
+        return x[start : start + int(length*total_len), :, :]
+
+    def __call__(self, x):
         crops = []
-        for transformation in self.transformations:
-            if transformation == 'global_polar':
-                crop = self.polar(data)
-                crops.append(crop)
-            elif transformation == 'global_lorentz':
-                v = np.random.uniform(-0.5, 0.5)
-                crop = self.lorentz(data, v)
-                crops.append(crop)
-            elif transformation == 'global_hyperbolic':
-                scale = np.random.uniform(0.5, 1.5)
-                crop = self.hyperbolic_amplitude_warp(data, scale)
-                crops.append(crop)
-        for transformation in self.local_transformations:
-            start = np.random.randint(0, total_len - self.local_len + 1)
-            x_slice = data[:, start : start + self.local_len]
-            if transformation == 'local_galilien':
-                a = np.random.uniform(0.5, 1.5)
-                crop = self.galienien(x_slice, a)
-                crops.append(crop)
-            elif transformation == 'local_hyperbolic_geometry':
-                crop = self.hyperbolictrnsform(x_slice)
-                crops.append(crop)
-            elif transformation == 'local_lorentz':
-                v = np.random.uniform(-0.5, 0.5)
-                crop = self.lorentz(x_slice, v)
-                crops.append(crop)
-            elif transformation == 'local_polar':
-                crop = self.polar(x_slice)
-                crops.append(crop)
+        crops.append(self.global_transform1(x))
+        crops.append(self.global_transform2(x))
+        crops.append(self.global_transform3(x))
+        local_transforms = [self.local_transform1, self.local_transform2, self.local_transform3,
+                            self.local_transform4, self.local_transform5, self.local_transform6]
+        for _ in range(self.transformation_group_size):
+            transform = random.choice(local_transforms)
+            crops.append(transform(x))
         return crops
-
-class HyperBolicGeometry(nn.Module):
-    def __init__(self, x, z_0):
-        self.x= x
-        self.z_0 = z_0
-    def hyperbolicGeomitry(self):
-        length = self.x.shape[-1]
-        t = torch.linspace(-0.9, 0.9, steps=length).to(self.x.device)
-        y = self.x[0]
-        y = 1.8 * (y-y.min()) / (y.max() - y.min()) - 0.9 
-        u = t
-        v = y
-        return torch.stack([u, v], dim=0)
-    def mobius_add(self, z, z0):
-        u, v = z[0], z[1]
-        u0, v0 = z0[0], z0[1]
-        num_re = (1 + 2*u0*u + 2*v0*v + (u0**2 + v0**2)*(u**2 + v**2))*u + (u0**2 + v0**2 - 1)*u0
-        num_im = (1 + 2*u0*u + 2*v0*v + (u0**2 + v0**2)*(u**2 + v**2))*v + (u0**2 + v0**2 - 1)*v0
-        denom = 1 + 2*(u0*u + v0*v) + (u0**2 + v0**2)*(u**2 + v**2)
         
-        return torch.stack([num_re / (denom + self.eps), num_im / (denom + self.eps)], dim=0)
-
-    def forward(self, x):
-        z = self.to_poincare(x)
-        z0 = torch.randn(2, 1).to(x.device)
-        z0 = 0.3 * z0 / (z0.norm() + self.eps)
-        z_shifted = self.mobius_add(z, z0)
-        
-        return z_shifted
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('DINO', parents=[get_args_parser()])
     args = parser.parse_args()
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    train_dino(args)
+    train_TS_DINO(args)

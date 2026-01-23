@@ -10,11 +10,11 @@ import torch.nn.functional as F
 import numpy as np
 
 from collections import OrderedDict
-from ..models.layers.pos_encoding import *
-from ..models.layers.basics import *
-from ..models.layers.attention import *
-from ..utils.util import get_activation_fn
-from ..utils.util import DropPath
+from models.layers.pos_encoding import *
+from models.layers.basics import *
+from utils.util import get_activation_fn
+from models.layers.attention import *
+from utils.util import DropPath
 
             
 # Cell
@@ -32,11 +32,11 @@ class PatchTST(nn.Module):
                  res_attention:bool=True, pre_norm:bool=False, store_attn:bool=False,
                  pe:str='zeros', learn_pe:bool=True, head_dropout = 0, 
                  head_type = "prediction", individual = False, 
-                 y_range:Optional[tuple]=None, verbose:bool=False, **kwargs):
+                 y_range:Optional[tuple]=None, verbose:bool=False, head = None, **kwargs):
 
         super().__init__()
 
-        assert head_type in ['pretrain', 'prediction', 'regression', 'classification'], 'head type should be either pretrain, prediction, or regression'
+        #assert head_type in ['pretrain', 'prediction', 'regression', 'classification'], 'head type should be either pretrain, prediction, or regression'
         # Backbone
         self.backbone = PatchTSTEncoder(c_in, num_patch=num_patch, patch_len=patch_len, 
                                 n_layers=n_layers, d_model=d_model, n_heads=n_heads, 
@@ -49,7 +49,9 @@ class PatchTST(nn.Module):
         self.n_vars = c_in
         self.head_type = head_type
 
-        if head_type == "pretrain":
+        if head_type == "Dino":
+            self.head = None
+        elif head_type == "pretrain":
             self.head = PretrainHead(d_model, patch_len, head_dropout) # custom head passed as a partial func with all its kwargs
         elif head_type == "prediction":
             self.head = PredictionHead(individual, self.n_vars, d_model, num_patch, target_dim, head_dropout)
@@ -63,8 +65,11 @@ class PatchTST(nn.Module):
         """
         z: tensor [bs x num_patch x n_vars x patch_len]
         """   
-        z = self.backbone(z)                                                                # z: [bs x nvars x d_model x num_patch]
-        z = self.head(z)                                                                    
+        z = self.backbone(z) 
+        if self.head_type == "Dino":                                                               # z: [bs x nvars x d_model x num_patch]
+            pass
+        else:
+            z = self.head(z)                                                                    
         # z: [bs x target_dim x nvars] for prediction
         #    [bs x target_dim] for regression
         #    [bs x target_dim] for classification
@@ -185,7 +190,11 @@ class PatchTSTEncoder(nn.Module):
         self.num_patch = num_patch
         self.patch_len = patch_len
         self.d_model = d_model
-        self.shared_embedding = shared_embedding        
+        self.shared_embedding = shared_embedding
+        #CLS token
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, self.d_model))
+        # Initialize it with small random values
+        trunc_normal_(self.cls_token, std=.02)        
 
         # Input encoding: projection of feature vectors onto a d-dim vector space
         if not shared_embedding: 
@@ -222,7 +231,7 @@ class PatchTSTEncoder(nn.Module):
         x = x.transpose(1,2)                                                     # x: [bs x nvars x num_patch x d_model]        
 
         u = torch.reshape(x, (bs*n_vars, num_patch, self.d_model) )              # u: [bs * nvars x num_patch x d_model]
-        u = self.dropout(u + self.W_pos)                                         # u: [bs * nvars x num_patch x d_model]
+        u = self.dropout(u + self.W_pos[:u.shape[1], :])                         
 
         # Encoder
         z = self.encoder(u)                                                      # z: [bs * nvars x num_patch x d_model]
